@@ -1,22 +1,16 @@
-"""Document-grounded question answering with Mistral, multilingual E5, and FAISS."""
+"""A small GPU RAG demo; importing this module never loads models."""
 
+from dataclasses import dataclass
+import math
+from numbers import Real
 import re
+from typing import Any
 
-import torch
-import numpy as np
-import faiss
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    pipeline,
-    BitsAndBytesConfig
-)
-from sentence_transformers import SentenceTransformer
+MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.3"
+EMBEDDING_MODEL_ID = "intfloat/multilingual-e5-base"
+REFUSAL = "Brak informacji w dokumencie."
 
-# ===============================
-# Dokument źródłowy (REGULAMIN)
-# ===============================
-document = """
+DOCUMENT = """
 Procedura reagowania na incydenty bezpieczeństwa IT w organizacji
 
 1. Cel procedury
@@ -76,137 +70,142 @@ Nieprzestrzeganie procedury może skutkować konsekwencjami służbowymi zgodnie
 
 """
 
-# ===============================
-# Chunking – nagłówek dołączany do następnej niepustej linii
-# ===============================
-def chunk_text(text):
-    chunks = []
-    pending_header = None
 
-    for raw in text.split("\n"):
+def chunk_text(text: str) -> list[str]:
+    """Keep each numbered section intact; attach any preamble to the first one.
+
+    This deliberately targets the short, numbered demo document, not arbitrary
+    long documents. Empty input is invalid. Even heading-only sections are kept.
+    """
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("The source document must be a non-empty string.")
+
+    chunks = []
+    current = []
+    seen_heading = False
+    for raw in text.splitlines():
         line = raw.strip()
         if not line:
             continue
-
-        is_header = bool(re.match(r"^\d+\.\s+.+$", line)) and len(line.split()) <= 6
-
-        if is_header:
-            pending_header = line
-            continue
-
-        if pending_header:
-            chunks.append(pending_header + " " + line)
-            pending_header = None
-        else:
-            chunks.append(line)
-
-    # jeśli dokument kończy się nagłówkiem bez treści
-    if pending_header:
-        chunks.append(pending_header)
-
+        is_heading = bool(re.match(r"^\d+\.\s+\S", line))
+        if is_heading and seen_heading:
+            chunks.append("\n".join(current))
+            current = []
+        current.append(line)
+        seen_heading = seen_heading or is_heading
+    if current:
+        chunks.append("\n".join(current))
     return chunks
 
-# ===============================
-# Retrieval (FAISS)
-# ===============================
-# Cel: wyszukac najbardziej podobne fragmenty dokumentu (chunks) na podstawie embeddingow.
-# Parametry retrieval:
-# - k (ile fragmentow zwracamy),
-# - score_threshold (minimalny prog podobienstwa; ponizej odrzucamy),
-# - meta (do analizy: jakie wyniki byly i jakie zostaly po odfiltrowaniu).
-def retrieve_context(query, k=3, score_threshold=None, return_meta=False):
-    # embedding zapytania (normalizowany)
-    q_emb = embedder.encode([query], normalize_embeddings=True)  # shape: (1, dim)
 
-    # FAISS: IndexFlatIP -> zwraca inner product (dla znormalizowanych wektorow ~ cos similarity)
-    scores, indices = index.search(np.array(q_emb), k)  # scores shape: (1,k), indices shape: (1,k)
+def _positive_integer(value: int, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer.")
 
-    results_all = []
-    results_kept = []
 
-    for rank, (score, idx) in enumerate(zip(scores[0], indices[0]), start=1):
-        if idx == -1:
-            continue
+def _finite_number(value: float, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number.")
 
-        item = {
-            "rank": rank,
-            "idx": int(idx),
-            "score": float(score),
-            "text": chunks[int(idx)]
+
+@dataclass
+class Retriever:
+    """One source's original chunks, embedding model, and normalized FAISS index."""
+
+    chunks: tuple[str, ...]
+    embedder: Any
+    index: Any
+
+    @classmethod
+    def from_text(cls, text: str, embedder: Any) -> "Retriever":
+        chunks = tuple(chunk_text(text))
+        import faiss
+        import numpy as np
+
+        # E5 prefixes belong only to embedding inputs, never the stored text.
+        embeddings = embedder.encode(
+            [f"passage: {chunk}" for chunk in chunks],
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )
+        embeddings = np.ascontiguousarray(embeddings, dtype=np.float32)
+        index = faiss.IndexFlatIP(embeddings.shape[1])
+        index.add(embeddings)
+        return cls(chunks, embedder, index)
+
+    def retrieve_context(self, query: str, k: int = 3,
+                         score_threshold: float | None = None) -> dict:
+        """Return ranked/kept passages and context. Clamp k to the corpus size.
+
+        Thresholds are finite cosine similarities in [-1, 1], not confidence
+        probabilities. None disables filtering. Invalid inputs raise ValueError.
+        """
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("The question must be a non-empty string.")
+        _positive_integer(k, "k")
+        if score_threshold is not None:
+            _finite_number(score_threshold, "score_threshold")
+            if not -1 <= score_threshold <= 1:
+                raise ValueError("score_threshold must be between -1 and 1.")
+        if not self.chunks:
+            raise ValueError("The retriever must contain at least one chunk.")
+
+        import numpy as np
+
+        question = query.strip()
+        effective_k = min(k, len(self.chunks))
+        q_emb = self.embedder.encode(
+            [f"query: {question}"],
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )
+        # Inner product of normalized vectors is cosine similarity.
+        scores, indices = self.index.search(
+            np.ascontiguousarray(q_emb, dtype=np.float32), effective_k
+        )
+        retrieved = []
+        for rank, (score, idx) in enumerate(zip(scores[0], indices[0]), start=1):
+            if idx == -1:  # FAISS can use -1 for an unfilled result slot.
+                continue
+            retrieved.append({
+                "rank": rank,
+                "idx": int(idx),
+                "score": float(score),
+                "text": self.chunks[int(idx)],
+            })
+        kept = [item for item in retrieved
+                if score_threshold is None or item["score"] >= score_threshold]
+        return {
+            "question": question,
+            "context": "\n\n".join(item["text"] for item in kept),
+            "retrieved_passages": retrieved,
+            "kept_passages": kept,
+            "retrieval_parameters": {
+                "k": k,
+                "effective_k": effective_k,
+                "score_threshold": score_threshold,
+            },
         }
-        results_all.append(item)
 
-        # filtr progowy (jesli ustawiony)
-        if (score_threshold is None) or (score >= score_threshold):
-            results_kept.append(item)
 
-    context = "\n\n".join([r["text"] for r in results_kept])
+@dataclass
+class AnswerGenerator:
+    """Generation state, separate from retrieval; both objects are loaded once."""
 
-    if not return_meta:
-        return context
+    tokenizer: Any
+    generator: Any
 
-    meta = {
-        "k": k,
-        "score_threshold": score_threshold,
-        "results_all": results_all,
-        "results_kept": results_kept
-    }
-    return context, meta
-
-# ===============================
-# Funkcja ask_bot
-# ===============================
-# Cel: polaczyc retrieval (FAISS) + generacje (LLM) w jeden przeplyw:
-# pytanie -> kontekst z dokumentu -> prompt -> krotka odpowiedz.
-def ask_bot(question, k=3, score_threshold=None, temperature=0.01, show_meta=False):
-    context, meta = retrieve_context(
-        question,
-        k=k,
-        score_threshold=score_threshold,
-        return_meta=True
-    )
-
-    print("-" * 80)
-    print("PYTANIE:")
-    print(question)
-    print("-" * 40)
-
-    # META (pokazuje jak dziala FAISS i prog)
-    if show_meta:
-        print("META (FAISS):")
-        print(f"- k={meta['k']}, score_threshold={meta['score_threshold']}")
-        print(f"- results_all={len(meta['results_all'])}, results_kept={len(meta['results_kept'])}")
-        # pokaz top wyniki (max 5) zeby bylo czytelnie
-        for r in meta["results_all"][:5]:
-            kept_flag = "KEPT" if r in meta["results_kept"] else "DROP"
-            preview = r["text"].replace("\n", " ")
-            preview = (preview[:90] + "...") if len(preview) > 90 else preview
-            print(f"  #{r['rank']} score={r['score']:.4f} {kept_flag} | {preview}")
-        print("-" * 40)
-
-    # KONTEKST
-    print("KONTEKST:")
-    if context.strip():
-        print(context)
-    else:
-        print("Brak pasujacych fragmentow.")
-    print("-" * 40)
-
-    # Jesli nie ma kontekstu -> twarda odmowa
-    if not context.strip():
-        print("ODPOWIEDŹ:")
-        print("Brak informacji w dokumencie.")
-        print("-" * 80)
-        return
-
-    base_prompt = f"""
+    def generate(self, question: str, context: str, *,
+                 temperature: float, max_new_tokens: int) -> str:
+        # These are instructions, not independent verification of the answer.
+        prompt_content = f"""
 Jestes asystentem, ktory odpowiada WYLACZNIE na podstawie DOKUMENTU.
 NIE WOLNO dodawac wiedzy spoza KONTEKSTU ani wyciagac wnioskow (inferencji).
 
 Zasady:
 1) Odpowiadasz tylko na podstawie tresci z sekcji KONTEKST.
 2) Jesli w KONTEKST nie ma informacji potrzebnej do odpowiedzi, zwroc DOKLADNIE:
-Brak informacji w dokumencie.
+{REFUSAL}
 3) Odpowiedz ma byc krotka: maks. 1 zdanie, jedna linia, bez wypunktowan.
 4) Jesli pytanie prosi o "przyklady" lub "wymien", a KONTEKST zawiera liste, wypisz elementy listy po przecinkach w jednym zdaniu.
 
@@ -217,111 +216,157 @@ PYTANIE:
 {question}
 
 ODPOWIEDŹ: (krotko, jedna linia)"""
+        # A single user message is sufficient for this Mistral instruction task.
+        prompt = self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt_content}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        generation_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": temperature > 0,
+            "num_beams": 1,
+        }
+        if temperature > 0:
+            generation_kwargs["temperature"] = temperature
+        output = self.generator(
+            prompt,
+            # The chat template already supplies the model's special tokens.
+            add_special_tokens=False,
+            return_full_text=False,
+            **generation_kwargs,
+        )[0]["generated_text"]
+        # Preserve the completion rather than silently discarding later lines.
+        return output.strip()
 
-    # Mistral Instruct wrapper
-    prompt = f"[INST] {base_prompt} [/INST]"
 
-    output = generator(
-        prompt,
-        max_new_tokens=70,
-        temperature=temperature,
-        do_sample=(temperature > 0),
-        return_full_text=False
-    )[0]["generated_text"]
+def ask_bot(question: str, retriever: Retriever, answer_generator: AnswerGenerator,
+            *, k: int = 3, score_threshold: float | None = None,
+            temperature: float = 0.0, max_new_tokens: int = 70) -> dict:
+    """Return an inspectable result without printing; reject invalid parameters.
 
-    answer = output.split("ODPOWIEDŹ:")[-1].strip()
-    answer = answer.split("\n")[0].strip()
+    Generation parameters record the requested settings even when generation is
+    skipped. no_context_refusal identifies only the deterministic pipeline path,
+    not a refusal produced by the language model itself.
+    """
+    _finite_number(temperature, "temperature")
+    if temperature < 0:
+        raise ValueError("temperature must be non-negative.")
+    _positive_integer(max_new_tokens, "max_new_tokens")
+    retrieval = retriever.retrieve_context(question, k, score_threshold)
+    no_context_refusal = not retrieval["kept_passages"]
+    if no_context_refusal:
+        answer = REFUSAL
+    else:
+        answer = answer_generator.generate(
+            retrieval["question"], retrieval["context"],
+            temperature=temperature, max_new_tokens=max_new_tokens,
+        )
+    return {
+        **retrieval,
+        "answer": answer,
+        "generation_parameters": {
+            "temperature": temperature,
+            "do_sample": temperature > 0,
+            "num_beams": 1,
+            "max_new_tokens": max_new_tokens,
+        },
+        "no_context_refusal": no_context_refusal,
+    }
 
-    print("ODPOWIEDŹ:")
-    print(answer)
+
+def print_result(result: dict) -> None:
+    """Console presentation only; query execution returns the full metadata."""
     print("-" * 80)
+    print("PYTANIE:", result["question"], sep="\n")
+    print("RETRIEVAL:", result["retrieval_parameters"])
+    print("GENERATION:", result["generation_parameters"])
+    kept_ids = {item["idx"] for item in result["kept_passages"]}
+    for item in result["retrieved_passages"]:
+        status = "KEPT" if item["idx"] in kept_ids else "DROP"
+        print(f"  #{item['rank']} score={item['score']:.4f} {status}")
+        print(item["text"])
+    print("KONTEKST:", result["context"] or "Brak pasujacych fragmentow.", sep="\n")
+    print("ODPOWIEDŹ:", result["answer"], sep="\n")
+    print("NO-CONTEXT REFUSAL:", result["no_context_refusal"])
 
 
-def main():
-    """Initialize the RAG pipeline and run the demonstration questions."""
-    global chunks, embedder, index, generator
+def load_pipeline(text: str = DOCUMENT) -> tuple[Retriever, AnswerGenerator]:
+    """Initialize this single-GPU demo explicitly; never called during import."""
+    chunk_text(text)  # Reject empty input before importing ML packages/downloading.
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError(
+            "Install requirements.txt with a CUDA-enabled PyTorch build to run the demo."
+        ) from exc
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "This demo requires a CUDA-capable NVIDIA GPU and CUDA-enabled PyTorch. "
+            "Both models use GPU 0; CPU inference is not supported."
+        )
 
-    chunks = chunk_text(document)
+    try:
+        # Check quantization dependencies before attempting model downloads.
+        import accelerate  # noqa: F401
+        import bitsandbytes  # noqa: F401
+        from sentence_transformers import SentenceTransformer
+        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, pipeline
 
-    # ===============================
-    # Model językowy – Mistral
-    # ===============================
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "Install requirements.txt in a compatible CUDA environment; this demo "
+            "requires bitsandbytes, accelerate, transformers, and sentence-transformers."
+        ) from exc
 
-    # Wybrany model
-    model_name = "mistralai/Mistral-7B-Instruct-v0.3"
-
-
-    # Mistral nie ma domyslnego pad_token; ustawiamy go jawnie na eos_token
-    # zeby pipeline nie wypisywal komunikatu "Setting pad_token_id..." przy kazdej generacji.
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    embedder = SentenceTransformer(EMBEDDING_MODEL_ID, device="cuda:0")
+    retriever = Retriever.from_text(text, embedder)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     tokenizer.pad_token = tokenizer.eos_token
-
-
-    # 4-bit quantization (bitsandbytes) -> mniejsze zuzycie VRAM na GPU
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4"
-    )
-
-    # Wymuszenie zaladowania modelu w calosci na GPU:0.
-    # device_map="auto" potrafil przerzucac czesc warstw na CPU/dysk i powodowac bledy / dlugie ladowanie.
     model = AutoModelForCausalLM.from_pretrained(
-        model_name,
+        MODEL_ID,
         device_map={"": 0},
-        quantization_config=bnb_config
+        quantization_config=bnb_config,
     )
-
-    # Pipeline do generacji tekstu; ten obiekt bedzie uzywany w ask_bot() do generowania odpowiedzi.
     generator = pipeline(
-        "text-generation",
-        model=model,
-        tokenizer=tokenizer
+        "text-generation", model=model, tokenizer=tokenizer,
+        pad_token_id=tokenizer.pad_token_id,
     )
+    return retriever, AnswerGenerator(tokenizer, generator)
 
-    # ===============================
-    # Embeddingi (polski + multi)
-    # ===============================
-    # Cel: zamienic tekst (pytania i chunki dokumentu) na wektory, ktore da sie porownywac.
-    # normalize_embeddings=True + IndexFlatIP => score ~ cosine similarity (im wyzszy, tym lepsze dopasowanie).
-    embedder = SentenceTransformer("intfloat/multilingual-e5-base")
 
-    chunk_embeddings = embedder.encode(
-        chunks,
-        normalize_embeddings=True
-    )
-
-    dim = chunk_embeddings.shape[1]
-    index = faiss.IndexFlatIP(dim)  # inner product na znormalizowanych wektorach = cosine similarity
-    index.add(np.array(chunk_embeddings))
-
-    # ===============================
-    # Demonstracje
-    # ===============================
-    BASE_TH = 0.35
-
-    # 1) RAG działa
-    ask_bot("Jaki jest cel procedury reagowania na incydenty?", k=3, score_threshold=BASE_TH, temperature=0.01)
-    ask_bot("Jak należy zgłosić incydent według dokumentu?", k=3, score_threshold=BASE_TH, temperature=0.01)
-
-    # 2) Odmowa spoza dokumentu
-    ask_bot("W jakiej temperaturze wrze woda?", k=3, score_threshold=BASE_TH, temperature=0.01)
-
-    # 3) score_threshold
-    ask_bot("Jak należy zgłosić incydent?", k=3, score_threshold=0.20, temperature=0.01, show_meta=True)
-    ask_bot("Jak należy zgłosić incydent?", k=3, score_threshold=0.89, temperature=0.01, show_meta=True)
-
-    # 4) k
-    ask_bot("Kto odpowiada za analizę techniczną i kto za eskalację incydentu?", k=1, score_threshold=BASE_TH, temperature=0.01, show_meta=True)
-    ask_bot("Kto odpowiada za analizę techniczną i kto za eskalację incydentu?", k=5, score_threshold=BASE_TH, temperature=0.01, show_meta=True)
-
-    # 5) temperature
-    Q_LISTA = "Wymien przyklady incydentow bezpieczenstwa IT podane w dokumencie."
-
-    ask_bot(Q_LISTA, k=5, score_threshold=0.20, temperature=0.01, show_meta=True)
-    ask_bot(Q_LISTA, k=5, score_threshold=0.20, temperature=0.50, show_meta=True)
-    ask_bot(Q_LISTA, k=5, score_threshold=0.20, temperature=0.90, show_meta=True)
+def main() -> None:
+    retriever, answer_generator = load_pipeline()
+    # These thresholds are provisional after section chunking and E5 prefixes.
+    # Phase 3 must evaluate them; they are not calibrated confidence cutoffs.
+    print("Similarity thresholds are provisional; GPU evaluation is pending.")
+    base_threshold = 0.35
+    list_question = "Wymien przyklady incydentow bezpieczenstwa IT podane w dokumencie."
+    # question, k, threshold, temperature; 0 selects greedy generation.
+    demonstrations = [
+        ("Jaki jest cel procedury reagowania na incydenty?", 3, base_threshold, 0.0),
+        ("Jak należy zgłosić incydent według dokumentu?", 3, base_threshold, 0.0),
+        ("W jakiej temperaturze wrze woda?", 3, base_threshold, 0.0),
+        ("Jak należy zgłosić incydent?", 3, 0.20, 0.0),
+        ("Jak należy zgłosić incydent?", 3, 0.89, 0.0),
+        ("Kto odpowiada za analizę techniczną i kto za eskalację incydentu?", 1, base_threshold, 0.0),
+        ("Kto odpowiada za analizę techniczną i kto za eskalację incydentu?", 5, base_threshold, 0.0),
+        (list_question, 5, 0.20, 0.0),
+        (list_question, 5, 0.20, 0.50),
+        (list_question, 5, 0.20, 0.90),
+    ]
+    for question, k, threshold, temperature in demonstrations:
+        result = ask_bot(
+            question, retriever, answer_generator,
+            k=k, score_threshold=threshold, temperature=temperature,
+        )
+        print_result(result)
 
 
 if __name__ == "__main__":
