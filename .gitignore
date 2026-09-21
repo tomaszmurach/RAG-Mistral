@@ -1,0 +1,30 @@
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Local environments and configuration
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Editors and notebooks
+.idea/
+.ipynb_checkpoints/
+
+# Project-local downloads and model artifacts
+/.cache/
+/models/
+/checkpoints/
+
+# Operating system metadata
+.DS_Store
+Thumbs.db

@@ -57,13 +57,29 @@ The system answers questions **only from the provided source document**. If the 
 
 ## Running the Project
 
-Install dependencies:
+The standalone script is `rag_demo.py`; no notebook is tracked. It loads the
+models, builds the FAISS index, and runs the ten demonstration questions when
+executed directly. Importing the module requires its dependencies but does not
+load models or run demonstrations.
+
+The current implementation requires a compatible NVIDIA GPU/PyTorch environment
+and sufficient GPU memory: Mistral is loaded in 4-bit mode entirely on GPU 0.
+There is no CPU fallback. First execution downloads the models from Hugging Face
+and requires internet access and local cache space.
+
+From the repository root, using your chosen Python environment:
 
 ```bash
-pip install -U bitsandbytes sentence-transformers faiss-cpu transformers accelerate
+python -m pip install -r requirements.txt
+python rag_demo.py
 ```
 
-Then run the notebook or script in **Google Colab with GPU enabled**.
+For Google Colab, select a GPU runtime, clone the repository, and run those
+commands from its directory in a shell cell.
+
+Dependencies are currently unpinned. An exact compatible combination of Python,
+PyTorch/CUDA, and the remaining libraries has not yet been verified, and a full
+GPU run is still pending. The dependency list is not a tested environment lock.
 
 ## Notes
 

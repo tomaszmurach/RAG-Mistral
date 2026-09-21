@@ -1,0 +1,9 @@
+# Direct imports plus dependencies used for quantized model loading.
+# Versions are unpinned: a compatible GPU environment has not yet been verified.
+torch
+numpy
+faiss-cpu
+transformers
+sentence-transformers
+bitsandbytes
+accelerate
