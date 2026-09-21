@@ -1,135 +1,116 @@
 # RAG with Mistral 7B and FAISS
 
-A compact Retrieval-Augmented Generation (RAG) project built with **Mistral-7B-Instruct-v0.3**, **multilingual-e5-base** embeddings, and **FAISS** for document-grounded question answering.
+A focused document-grounded question-answering demonstration using
+**Mistral-7B-Instruct-v0.3**, **multilingual-e5-base**, and **FAISS** on a short
+Polish IT incident-response procedure.
 
-## Overview
+**document → section chunks → E5 embeddings → FAISS retrieval → chat prompt → answer**
 
-This project implements a simple RAG pipeline:
+The pipeline completed end-to-end in Google Colab on a Tesla T4. The results below
+come from that run, **before the latest prompt and generation-configuration changes**.
+Those changes still require a follow-up GPU smoke run.
 
-**document -> chunking -> embeddings -> FAISS -> retrieval -> prompt -> generation**
+## How it works
 
-The model is instructed to answer only from retrieved document passages. If no
-passages survive similarity filtering, the pipeline returns the fixed refusal
-`Brak informacji w dokumencie.` without calling the language model. When passages
-exist, grounding and refusal depend on model instructions: answers are not
-independently verified and unsupported content remains possible.
+- One chunk per numbered section preserves headings and all section content;
+  the document title stays with the first section (15 chunks total).
+- E5 embeds `passage: <text>` and `query: <text>`, with normalized vectors and
+  FAISS `IndexFlatIP` cosine-similarity search. Prefixes affect embeddings only.
+- Defaults: **k = 3**, **similarity threshold = 0.82**, **temperature = 0.0**,
+  with up to 70 new tokens. Zero temperature uses greedy decoding; positive
+  temperatures enable sampling.
+- Mistral uses 4-bit NF4 quantization and its tokenizer's chat template. Both
+  models run on GPU 0; CPU inference and multi-GPU execution are not implemented.
 
-## Tech Stack
+## Grounding and evaluation
 
-- Python
-- Google Colab
-- Hugging Face Transformers
-- Mistral-7B-Instruct-v0.3
-- Sentence Transformers
-- FAISS
-- PyTorch
-- bitsandbytes
-- accelerate
+Refusal has two distinct paths:
 
-## Key Features
+1. **Pipeline refusal:** no passages survive filtering → return
+   `Brak informacji w dokumencie.` without calling Mistral.
+2. **Model-instruction refusal:** passages exist, but the requested fact is not
+   explicitly stated → Mistral is instructed to return the same wording. This
+   behavior is not independently verified or guaranteed.
 
-- Document-grounded question answering
-- Semantic retrieval with FAISS
-- 4-bit quantized Mistral model for more efficient Colab usage
-- Configurable retrieval depth with `k`
-- Optional similarity filtering with `score_threshold`
-- Greedy generation at `temperature=0`; sampling at positive temperatures
-- Deterministic refusal when no passages survive filtering
-- Structured query results, with separate console presentation
+The **0.82 threshold was selected empirically for this corpus and small evaluation
+set**. It is a coarse relevance filter, not an answerability test, confidence
+probability, or universal E5 threshold. On-topic unanswerable questions can score
+highly and still produce unsupported answers.
 
-## How It Works
+The original 10 answerable questions retrieved the expected section at top-1.
+All 16 answerable paraphrases scored at least 0.82; 15 retrieved the expected
+section first. An observed unsupported inference at threshold 0.80 motivated
+stricter instructions and the new threshold. See [recorded results](examples/results.md)
+for score ranges, refusal outcomes, and limitations.
 
-1. Each numbered section becomes one chunk, keeping its heading and all its
-   content together. The title/preamble stays with the first section.
-2. Chunks are embedded as `passage: <text>` with `multilingual-e5-base`.
-3. Normalized embeddings are indexed in FAISS `IndexFlatIP`, giving cosine
-   similarity scores.
-4. The question is embedded as `query: <text>`, also normalized, and matched
-   against the document chunks. E5 prefixes affect embedding inputs only;
-   stored passages, displayed text, and prompt context remain unprefixed.
-5. Kept passages enter a single user message formatted with the tokenizer's chat
-   template. Special tokens are not added a second time during tokenization.
-6. Mistral is instructed to produce a short, context-grounded answer. The returned
-   completion is retained, apart from surrounding whitespace, so formatting
-   deviations are not hidden by truncating it to one line.
+## Verified environment
 
-The E5 formatting follows the [model's retrieval conventions](https://huggingface.co/intfloat/multilingual-e5-base#faq).
-Chunking targets this short, numbered document; it does not split arbitrarily
-long sections to fit model token limits.
+One successful environment is recorded here; it does not establish compatibility
+elsewhere or imply that this is the only environment that could work.
 
-## Core Functions
+| Component | Observed version / hardware |
+|---|---|
+| Platform / GPU | Google Colab / Tesla T4, 15360 MiB VRAM |
+| Python | 3.13.15 |
+| PyTorch / CUDA reported by PyTorch | 2.11.0+cu128 / 12.8 |
+| Transformers | 5.16.1 |
+| Sentence Transformers | 5.7.0 |
+| bitsandbytes | 0.50.2 |
+| accelerate | 1.14.0 |
+| NumPy | 2.1.3 |
+| FAISS (`faiss-cpu`) | 1.15.1 |
 
-- `chunk_text(text)` prepares complete section chunks.
-- `Retriever.from_text(text, embedder)` builds retrieval state once: original
-  chunks, the embedding model, and its FAISS index.
-- `retriever.retrieve_context(query, k=3, score_threshold=None)` returns ranked
-  passages, kept passages, scores, context, and requested/effective retrieval settings.
-- `AnswerGenerator(tokenizer, generator)` holds the separate generation state.
-- `ask_bot(question, retriever, answer_generator, *, k=3, score_threshold=None,
-  temperature=0.0, max_new_tokens=70)` returns a dictionary containing the question,
-  retrieval details, answer, generation settings, and `no_context_refusal` flag.
-  Settings are recorded even if generation is skipped. A model-generated refusal
-  does not set this flag.
-- `print_result(result)` handles console output; `load_pipeline()` explicitly
-  initializes the two models and retrieval index.
+Observed GPU memory after loading both models: approximately **5317 MiB
+(~5.2 GiB)**. This is a loaded-pipeline observation, not peak generation memory
+or a minimum VRAM requirement. The pre-update lightweight suite passed **20/20**
+in Colab, and the complete Mistral + E5 + FAISS pipeline ran successfully.
 
-Blank questions/documents, nonpositive or noninteger `k`, and invalid token
-limits raise `ValueError`. Oversized `k` is capped at the number of chunks, with
-both requested and effective values recorded. A threshold must be `None` (no
-filter) or a finite number in `[-1, 1]`; temperature must be finite and nonnegative.
-Boolean values are not accepted as numeric parameters. Questions are trimmed.
-Zero temperature uses greedy decoding without passing sampling-only parameters.
-It does not imply bit-for-bit reproducibility across different hardware/software.
+## Run
 
-## Example Test Scenarios
-
-- Answering questions covered by the document
-- Observing refusal behavior on out-of-scope questions
-- Comparing different `k` values
-- Testing the effect of `score_threshold`
-- Observing answer style changes with different `temperature` values
-
-These are demonstrations, not measured evaluation results. Thresholds `0.20`,
-`0.35`, and `0.89` remain **provisional**: E5 prefixes and section-level chunking
-change scores, so Phase 3 GPU evaluation must reassess them. Cosine scores are not
-confidence probabilities. With filtering disabled, nearest passages are returned
-even for unrelated questions.
-
-## Running the Project
-
-The standalone script is `rag_demo.py`; no notebook is tracked. It loads the
-models, builds the FAISS index, and runs the ten demonstration questions when
-executed directly. Importing the module uses only the Python standard library;
-ML dependencies and models are loaded explicitly when needed. The source uses
-Python 3.10+ syntax; a complete supported GPU environment is not yet verified.
-
-The current implementation requires a compatible NVIDIA GPU/PyTorch environment
-and sufficient GPU memory: Mistral is loaded in 4-bit mode entirely on GPU 0,
-and the embedding model also uses GPU 0. Startup checks CUDA availability and
-quantization dependencies. There is no CPU fallback. First execution downloads the models from Hugging Face
-and requires internet access and local cache space.
-
-From the repository root, using your chosen Python environment:
+In Colab, select a **T4 GPU runtime**. Run the following from a `%%bash` cell
+(or a shell in an equivalent Linux environment). Model downloads need internet
+access and local cache space.
 
 ```bash
+git clone https://github.com/tomaszmurach/RAG-Mistral.git
+cd RAG-Mistral
+# Reuse this build if already installed; otherwise install the verified CUDA wheel.
+python -m pip install 'torch==2.11.0+cu128' --index-url https://download.pytorch.org/whl/cu128
 python -m pip install -r requirements.txt
 python rag_demo.py
 ```
 
-For Google Colab, select a GPU runtime, clone the repository, and run those
-commands from its directory in a shell cell.
+The explicit CUDA-wheel step follows [PyTorch's versioned installation guidance](https://pytorch.org/get-started/previous-versions/).
+`requirements.txt` pins only direct project dependencies. Its `torch==2.11.0`
+pin accepts the verified `+cu128` build but does not select a CUDA wheel by itself.
+No CUDA/NVIDIA transitive packages or unrelated Colab packages are pinned.
+These are observed working versions, not a complete environment lock.
 
-Dependencies are currently unpinned. An exact compatible combination of Python,
-PyTorch/CUDA, and the remaining libraries has not yet been verified, and a full
-GPU run is still pending. The dependency list is not a tested environment lock.
+The demo covers a direct question, a paraphrase, an on-topic missing fact, an
+out-of-domain question, and a question asking for two responsibilities.
 
-Lightweight regression checks use `unittest` and NumPy, with embedding, FAISS,
-tokenizer, and generation doubles; they do not download models or require CUDA:
+## Code and lightweight checks
+
+`load_pipeline()` initializes a `Retriever` and an `AnswerGenerator` once.
+`ask_bot(question, retriever, answer_generator, ...)` returns a dictionary with
+ranked/kept passages, scores, context, parameters, answer, and `no_context_refusal`.
+`print_result()` provides console output. Importing the module loads no models.
+
+Override `k`, `score_threshold`, `temperature`, or `max_new_tokens` via `ask_bot()`;
+`score_threshold=None` disables filtering. Oversized `k` is capped and recorded.
+Blank questions/documents, invalid integer limits, nonfinite numbers, thresholds
+outside `[-1, 1]`, and negative temperatures raise `ValueError`.
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-## Notes
+The expanded suite has **22 lightweight checks**, using NumPy and model/FAISS
+doubles without downloads or CUDA. These checks do not validate model quality or
+prove that real Transformers warnings are gone. The final modified version needs
+a GPU smoke run, including greedy and sampling calls and the known hard negative
+at both 0.82 (pipeline refusal) and an explicit 0.80 override (model refusal).
 
-This project uses a single manually defined source document and a simple chunking strategy. It is designed as a focused demonstration of the RAG workflow rather than a production-ready knowledge system.
+This remains a small demonstration: the section chunker targets this short
+corpus, answers are not independently verified, and longer documents would need
+explicit token-budget handling.

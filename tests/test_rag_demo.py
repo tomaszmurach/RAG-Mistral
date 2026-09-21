@@ -78,6 +78,10 @@ class QueryTests(unittest.TestCase):
         self.tokenizer = Mock()
         self.tokenizer.apply_chat_template.return_value = "template-formatted prompt"
         self.generator = Mock(return_value=[{"generated_text": "  First line.\nSecond line.  "}])
+        self.generator.generation_config = SimpleNamespace(
+            max_length=4096, max_new_tokens=256, do_sample=True,
+            temperature=0.7, num_beams=1, eos_token_id=2, pad_token_id=2,
+        )
         self.answer_generator = rag.AnswerGenerator(self.tokenizer, self.generator)
 
     def ask(self, **kwargs):
@@ -143,6 +147,26 @@ class QueryTests(unittest.TestCase):
         self.assertEqual(result["answer"], rag.REFUSAL)
         self.assertFalse(result["no_context_refusal"])
 
+    def test_corpus_defaults_keep_control_but_reject_observed_hard_negative_score(self):
+        # Supplied evaluation scores exercise filtering, not simulated LLM quality.
+        self.retriever.index.search = Mock(return_value=(
+            np.array([[0.8337, 0.8191, 0.7771]]), np.array([[0, 1, 2]]),
+        ))
+        result = self.ask()
+        self.assertEqual(result["retrieval_parameters"], {
+            "k": 3, "effective_k": 3, "score_threshold": 0.82,
+        })
+        self.assertEqual(result["generation_parameters"]["temperature"], 0.0)
+        self.assertEqual([item["idx"] for item in result["kept_passages"]], [0])
+        self.retriever.index.search.return_value = (
+            np.array([[0.8191, 0.7771, 0.7020]]), np.array([[0, 1, 2]]),
+        )
+        self.generator.reset_mock()
+        self.assertEqual(self.retriever.retrieve_context("Question?")["kept_passages"], [])
+        self.assertTrue(self.ask()["no_context_refusal"])
+        self.generator.assert_not_called()
+        self.assertFalse(self.ask(score_threshold=0.80)["no_context_refusal"])
+
     def test_chat_template_and_greedy_generation_preserve_completion(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -153,24 +177,49 @@ class QueryTests(unittest.TestCase):
         self.assertEqual(len(args[0]), 1)
         self.assertEqual(args[0][0]["role"], "user")
         self.assertIn(rag.REFUSAL, args[0][0]["content"])
+        self.assertIn("podany wprost i jednoznacznie", args[0][0]["content"])
+        self.assertIn("Samo podobieństwo tematyczne nie wystarcza", args[0][0]["content"])
+        self.assertIn(
+            "Nie wyciągaj wniosków o brakujących faktach z nazw organizacji, ról, kontekstu ani wiedzy ogólnej",
+            args[0][0]["content"],
+        )
         self.assertNotIn("[INST]", args[0][0]["content"])
         self.assertEqual(kwargs, {"tokenize": False, "add_generation_prompt": True})
-        self.generator.assert_called_once_with(
-            "template-formatted prompt", add_special_tokens=False, return_full_text=False,
-            max_new_tokens=90, do_sample=False, num_beams=1,
-        )
+        self.generator.assert_called_once()
+        generation_args, generation_kwargs = self.generator.call_args
+        self.assertEqual(generation_args, ("template-formatted prompt",))
+        generation_kwargs = dict(generation_kwargs)
+        config = generation_kwargs.pop("generation_config")
+        self.assertEqual(generation_kwargs, {
+            "add_special_tokens": False, "return_full_text": False,
+            "clean_up_tokenization_spaces": False,
+        })  # No generation-related kwargs accompany the config.
+        self.assertIsNone(config.max_length)
+        self.assertEqual(config.max_new_tokens, 90)
+        self.assertFalse(config.do_sample)
+        self.assertEqual(config.num_beams, 1)
+        self.assertEqual(config.temperature, 1.0)  # Neutral, ignored in greedy mode.
+        self.assertEqual((config.eos_token_id, config.pad_token_id), (2, 2))
+        self.assertIsNot(config, self.generator.generation_config)
+        self.assertEqual(self.generator.generation_config.max_length, 4096)
+        self.assertEqual(self.generator.generation_config.temperature, 0.7)
 
     def test_positive_temperature_enables_sampling(self):
         result = self.ask(temperature=0.5)
-        self.assertTrue(self.generator.call_args.kwargs["do_sample"])
-        self.assertEqual(self.generator.call_args.kwargs["temperature"], 0.5)
+        config = self.generator.call_args.kwargs["generation_config"]
+        self.assertTrue(config.do_sample)
+        self.assertEqual(config.temperature, 0.5)
         self.assertEqual(result["generation_parameters"]["temperature"], 0.5)
+        self.ask(temperature=0)
+        self.assertFalse(self.generator.call_args.kwargs["generation_config"].do_sample)
+        self.assertTrue(config.do_sample)  # Later calls do not mutate earlier configs.
+        self.assertEqual(config.temperature, 0.5)
 
     def test_oversized_k_is_capped_and_recorded(self):
         result = self.ask(k=100)
         self.assertEqual(self.retriever.index.last_k, 3)
         self.assertEqual(result["retrieval_parameters"], {
-            "k": 100, "effective_k": 3, "score_threshold": None,
+            "k": 100, "effective_k": 3, "score_threshold": 0.82,
         })
 
     def test_invalid_questions_do_not_encode_or_generate(self):
@@ -205,6 +254,30 @@ class QueryTests(unittest.TestCase):
 
 
 class InitializationTests(unittest.TestCase):
+    def test_model_length_and_padding_config_are_set_before_pipeline_construction(self):
+        torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True), float16="float16")
+        model = SimpleNamespace(generation_config=SimpleNamespace(max_length=4096, pad_token_id=None))
+        tokenizer = SimpleNamespace(eos_token="</s>", pad_token_id=2)
+
+        def create_pipeline(*args, **kwargs):
+            self.assertIsNone(model.generation_config.max_length)
+            self.assertEqual(model.generation_config.pad_token_id, 2)
+            self.assertEqual(args, ("text-generation",))
+            self.assertEqual(kwargs, {"model": model, "tokenizer": tokenizer})
+            return Mock()
+
+        modules = {
+            "torch": torch, "accelerate": SimpleNamespace(), "bitsandbytes": SimpleNamespace(),
+            "sentence_transformers": SimpleNamespace(SentenceTransformer=Mock()),
+            "transformers": SimpleNamespace(
+                AutoModelForCausalLM=SimpleNamespace(from_pretrained=Mock(return_value=model)),
+                AutoTokenizer=SimpleNamespace(from_pretrained=Mock(return_value=tokenizer)),
+                BitsAndBytesConfig=Mock(), pipeline=create_pipeline,
+            ),
+        }
+        with patch.dict(sys.modules, modules), patch.object(rag.Retriever, "from_text"):
+            rag.load_pipeline()
+
     def test_import_needs_no_ml_packages_and_has_no_side_effect_output(self):
         script = """
 import sys

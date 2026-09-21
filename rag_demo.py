@@ -1,5 +1,6 @@
 """A small GPU RAG demo; importing this module never loads models."""
 
+from copy import deepcopy
 from dataclasses import dataclass
 import math
 from numbers import Real
@@ -9,6 +10,10 @@ from typing import Any
 MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.3"
 EMBEDDING_MODEL_ID = "intfloat/multilingual-e5-base"
 REFUSAL = "Brak informacji w dokumencie."
+DEFAULT_K = 3
+# Selected from a small evaluation of THIS corpus; not an answerability cutoff.
+DEFAULT_SCORE_THRESHOLD = 0.82
+DEFAULT_TEMPERATURE = 0.0
 
 DOCUMENT = """
 Procedura reagowania na incydenty bezpieczeństwa IT w organizacji
@@ -133,8 +138,8 @@ class Retriever:
         index.add(embeddings)
         return cls(chunks, embedder, index)
 
-    def retrieve_context(self, query: str, k: int = 3,
-                         score_threshold: float | None = None) -> dict:
+    def retrieve_context(self, query: str, k: int = DEFAULT_K,
+                         score_threshold: float | None = DEFAULT_SCORE_THRESHOLD) -> dict:
         """Return ranked/kept passages and context. Clamp k to the corpus size.
 
         Thresholds are finite cosine similarities in [-1, 1], not confidence
@@ -199,15 +204,14 @@ class AnswerGenerator:
                  temperature: float, max_new_tokens: int) -> str:
         # These are instructions, not independent verification of the answer.
         prompt_content = f"""
-Jestes asystentem, ktory odpowiada WYLACZNIE na podstawie DOKUMENTU.
-NIE WOLNO dodawac wiedzy spoza KONTEKSTU ani wyciagac wnioskow (inferencji).
-
-Zasady:
-1) Odpowiadasz tylko na podstawie tresci z sekcji KONTEKST.
-2) Jesli w KONTEKST nie ma informacji potrzebnej do odpowiedzi, zwroc DOKLADNIE:
+Odpowiadasz wyłącznie na podstawie sekcji KONTEKST.
+Żądany fakt musi być podany wprost i jednoznacznie. Samo podobieństwo tematyczne nie wystarcza.
+Nie wyciągaj wniosków o brakujących faktach z nazw organizacji, ról, kontekstu ani wiedzy ogólnej.
+Jeśli kontekst jest związany z pytaniem, ale nie zawiera wprost żądanego faktu,
+lub nie ma w nim potrzebnej informacji, zwróć DOKŁADNIE:
 {REFUSAL}
-3) Odpowiedz ma byc krotka: maks. 1 zdanie, jedna linia, bez wypunktowan.
-4) Jesli pytanie prosi o "przyklady" lub "wymien", a KONTEKST zawiera liste, wypisz elementy listy po przecinkach w jednym zdaniu.
+Odpowiedz krótko: maksymalnie jedno zdanie, jedna linia, bez wypunktowań.
+Jeśli pytanie prosi o listę, wypisz tylko elementy podane w kontekście, oddzielone przecinkami.
 
 KONTEKST:
 {context}
@@ -222,27 +226,30 @@ ODPOWIEDŹ: (krotko, jedna linia)"""
             tokenize=False,
             add_generation_prompt=True,
         )
-        generation_kwargs = {
-            "max_new_tokens": max_new_tokens,
-            "do_sample": temperature > 0,
-            "num_beams": 1,
-        }
-        if temperature > 0:
-            generation_kwargs["temperature"] = temperature
+        # Keep token IDs/model defaults, but never mutate shared config per query.
+        # Transformers 5.16.1 expects a config OR generation kwargs, not both.
+        generation_config = deepcopy(self.generator.generation_config)
+        generation_config.max_length = None
+        generation_config.max_new_tokens = max_new_tokens
+        generation_config.do_sample = temperature > 0
+        generation_config.num_beams = 1
+        # Neutral when greedy, avoiding an inherited sampling temperature warning.
+        generation_config.temperature = temperature if temperature > 0 else 1.0
         output = self.generator(
             prompt,
             # The chat template already supplies the model's special tokens.
             add_special_tokens=False,
             return_full_text=False,
-            **generation_kwargs,
+            clean_up_tokenization_spaces=False,
+            generation_config=generation_config,
         )[0]["generated_text"]
         # Preserve the completion rather than silently discarding later lines.
         return output.strip()
 
 
 def ask_bot(question: str, retriever: Retriever, answer_generator: AnswerGenerator,
-            *, k: int = 3, score_threshold: float | None = None,
-            temperature: float = 0.0, max_new_tokens: int = 70) -> dict:
+            *, k: int = DEFAULT_K, score_threshold: float | None = DEFAULT_SCORE_THRESHOLD,
+            temperature: float = DEFAULT_TEMPERATURE, max_new_tokens: int = 70) -> dict:
     """Return an inspectable result without printing; reject invalid parameters.
 
     Generation parameters record the requested settings even when generation is
@@ -334,38 +341,29 @@ def load_pipeline(text: str = DOCUMENT) -> tuple[Retriever, AnswerGenerator]:
         device_map={"": 0},
         quantization_config=bnb_config,
     )
+    # In 5.16.1, the length-warning check consults BOTH the model config and
+    # the per-call config before filling defaults. Clear the legacy limit here
+    # and on each query so max_new_tokens is the only explicit length control.
+    model.generation_config.max_length = None
+    model.generation_config.pad_token_id = tokenizer.pad_token_id
     generator = pipeline(
         "text-generation", model=model, tokenizer=tokenizer,
-        pad_token_id=tokenizer.pad_token_id,
     )
     return retriever, AnswerGenerator(tokenizer, generator)
 
 
 def main() -> None:
     retriever, answer_generator = load_pipeline()
-    # These thresholds are provisional after section chunking and E5 prefixes.
-    # Phase 3 must evaluate them; they are not calibrated confidence cutoffs.
-    print("Similarity thresholds are provisional; GPU evaluation is pending.")
-    base_threshold = 0.35
-    list_question = "Wymien przyklady incydentow bezpieczenstwa IT podane w dokumencie."
-    # question, k, threshold, temperature; 0 selects greedy generation.
+    # Representative cases, all using the corpus-specific defaults.
     demonstrations = [
-        ("Jaki jest cel procedury reagowania na incydenty?", 3, base_threshold, 0.0),
-        ("Jak należy zgłosić incydent według dokumentu?", 3, base_threshold, 0.0),
-        ("W jakiej temperaturze wrze woda?", 3, base_threshold, 0.0),
-        ("Jak należy zgłosić incydent?", 3, 0.20, 0.0),
-        ("Jak należy zgłosić incydent?", 3, 0.89, 0.0),
-        ("Kto odpowiada za analizę techniczną i kto za eskalację incydentu?", 1, base_threshold, 0.0),
-        ("Kto odpowiada za analizę techniczną i kto za eskalację incydentu?", 5, base_threshold, 0.0),
-        (list_question, 5, 0.20, 0.0),
-        (list_question, 5, 0.20, 0.50),
-        (list_question, 5, 0.20, 0.90),
+        "Jak należy zgłosić incydent według dokumentu?",
+        "Co powinien zrobić pracownik, gdy zauważy podejrzane zdarzenie?",
+        "Kto jest właścicielem tej procedury?",
+        "W jakiej temperaturze wrze woda?",
+        "Kto odpowiada za analizę techniczną i kto za eskalację incydentu?",
     ]
-    for question, k, threshold, temperature in demonstrations:
-        result = ask_bot(
-            question, retriever, answer_generator,
-            k=k, score_threshold=threshold, temperature=temperature,
-        )
+    for question in demonstrations:
+        result = ask_bot(question, retriever, answer_generator)
         print_result(result)
 
 
