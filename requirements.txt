@@ -1,0 +1,10 @@
+# Direct package versions from the successful Colab/T4 run (Python 3.13.15).
+# Install/reuse the CUDA build of torch first; see README. This public version
+# pin accepts the verified torch 2.11.0+cu128 without hard-coding a wheel platform.
+torch==2.11.0
+numpy==2.1.3
+faiss-cpu==1.15.1
+transformers==5.16.1
+sentence-transformers==5.7.0
+bitsandbytes==0.50.2
+accelerate==1.14.0
