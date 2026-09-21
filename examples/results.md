@@ -1,10 +1,11 @@
 # Recorded evaluation results
 
-These are supplied observations from the successful **pre-update** Colab run.
-This is a small evaluation set for the demonstration corpus, not a benchmark;
-no statistical significance or generalization to other corpora is claimed.
+This records the maintainer's Colab/T4 observations, separating **historical
+pre-update evaluation** from **final post-update verification**. This is a small
+evaluation set for the demonstration corpus, not a benchmark; no statistical
+significance or generalization to other corpora is claimed.
 
-## Environment
+## Verified environment (both runs)
 
 | Component | Observed version / hardware |
 |---|---|
@@ -15,11 +16,14 @@ no statistical significance or generalization to other corpora is claimed.
 | bitsandbytes / accelerate | 0.50.2 / 1.14.0 |
 | NumPy / FAISS | 2.1.3 / 1.15.1 |
 
-Approximately 5317 MiB (~5.2 GiB) GPU memory was observed after loading both
-models; peak generation memory was not reported. The complete Mistral + E5 +
-FAISS pipeline succeeded, and the then-current lightweight suite passed 20/20.
+## Historical evaluation (pre-update)
 
-## Retrieval evaluation
+Before the prompt and generation-configuration updates, approximately 5317 MiB
+(~5.2 GiB) GPU memory was observed after loading both models. The complete
+Mistral + E5 + FAISS pipeline succeeded, and the then-current suite passed 20/20.
+The measurements in this section were not collected from the final code.
+
+### Retrieval evaluation
 
 Scores are top-1 cosine similarities from normalized E5 embeddings.
 
@@ -32,7 +36,7 @@ Scores are top-1 cosine similarities from normalized E5 embeddings.
 On-topic unanswerable scores overlap answerable scores. Similarity can filter
 coarse irrelevance, but cannot establish that the requested fact exists.
 
-## Paraphrase robustness
+### Paraphrase robustness
 
 - 16/16 answerable paraphrases scored at least 0.82; minimum score: **0.8337**.
 - 15/16 retrieved the expected section at top-1.
@@ -43,7 +47,7 @@ These observations support 0.82 as a default coarse filter for this small corpus
 and evaluation set. They do not establish a universal E5 cutoff or guarantee
 recall on new questions.
 
-## Grounding and refusal at threshold 0.80
+### Grounding and refusal at threshold 0.80
 
 | Group | Observed outcome |
 |---|---|
@@ -56,27 +60,66 @@ The one unsupported inference was:
 - Question: **Kto jest właścicielem tej procedury?**
 - Top retrieval score: **0.8191**.
 - At threshold **0.80**, passages reached Mistral, which answered **Organizacja**.
-- At threshold **0.82**, that recorded score would fail retrieval filtering.
-  This is a consequence of the recorded score, not a new measured model run.
+- That score predicted rejection at threshold **0.82**. This was initially an
+  inference from the recorded score; the final run below subsequently confirmed it.
 
 The failure motivated two changes: a corpus-specific default threshold of 0.82
 and a stricter Polish prompt requiring explicit evidence and forbidding inference
 from organization names, roles, context, or general knowledge. Some other
 on-topic unanswerable scores exceed 0.82, so model refusal remains necessary
-and fallible. The stricter prompt's effectiveness has not yet been measured.
+and fallible. These historical measurements did not evaluate the strengthened
+prompt; that check is recorded in the final verification below.
 
-## Verification boundary
+## Final verification (post-update)
 
-The observations above precede the new prompt and Transformers warning cleanup.
-The expanded 22-test lightweight suite exercises filtering, generation settings,
-and refusal control flow; model and FAISS doubles do not reproduce GPU inference.
-A follow-up Colab smoke run must check the current demo, greedy and sampling
-calls, the known hard negative, and warning output before the modified version
-can be described as GPU-verified. For the hard negative, check both the default
-0.82 filter and an explicit 0.80 override: rejecting it before generation does
-not evaluate the stricter prompt's model-refusal behavior.
+The final modified implementation completed its real-GPU smoke run in the
+environment above, and **22/22 lightweight tests passed**. Defaults were
+`k=3`, `score_threshold=0.82`, and `temperature=0.0`.
 
-The supplied evidence contains aggregate results and the hard-negative example,
-not the full question list, raw outputs, or model revision hashes. This summary
-therefore records the available evidence rather than claiming a fully
-reproducible evaluation dataset.
+The smoke controls were:
+
+- **Answerable:** “Jak należy zgłosić incydent?”
+- **Known hard negative:** “Kto jest właścicielem tej procedury?”
+- **Out-of-domain:** “W jakiej temperaturze wrze woda?”
+
+| Case | Threshold | Temperature | Observed result | `no_context_refusal` |
+|---|---:|---:|---|---|
+| Answerable, greedy | 0.82 | 0.0 | Relevant passages kept; correct grounded answer | `False` |
+| Answerable, sampling | 0.82 | 0.5 | Sampling succeeded; grounded answer remained correct | `False` |
+| Hard negative, default filter | 0.82 | 0.0 | Top score ~0.8191; all passages rejected; fixed refusal | `True` |
+| Hard negative, lower filter | 0.80 | 0.0 | Passages reached Mistral; exact model refusal | `False` |
+| Out-of-domain control | 0.82 | 0.0 | Passages rejected; fixed refusal | `True` |
+
+The fixed refusal and the exact model refusal were both
+`Brak informacji w dokumencie.` At threshold 0.80, the strengthened prompt
+corrected the previously observed unsupported answer, `Organizacja`, for this
+tested question. The `False` flag distinguishes model refusal from the
+deterministic no-context pipeline path. This does not guarantee refusal on all
+unanswerable questions.
+
+The previous project-owned Transformers warnings were **no longer observed**:
+
+- `generation_config` passed together with generation-related kwargs;
+- conflicting `max_length` and `max_new_tokens` settings;
+- `clean_up_tokenization_spaces` for a BPE tokenizer.
+
+The unauthenticated Hugging Face Hub request warning still appeared with
+`HF_TOKEN` unset. This is expected, not a project error; no token requirement
+or warning suppression was introduced.
+
+GPU memory after final pipeline loading/use was approximately **5500 MiB
+(~5.4 GiB)**. Both this and the earlier 5317 MiB reading are observed loaded-runtime
+values, not peak-memory measurements or minimum-VRAM guarantees.
+
+## Evidence and limitations
+
+Historical retrieval aggregates and final smoke observations are separate; the
+historical evaluation was not claimed to have been rerun in full on the final
+code. The supplied evidence does not include the complete historical question
+list, raw outputs, or model revision hashes, so this is a record of the available
+evidence rather than a fully reproducible evaluation dataset.
+
+Threshold 0.82 is specific to this corpus/evaluation set. Grounding remains
+instruction-based and is not independently verified. The successful smoke cases
+do not establish statistical significance, general model accuracy, or compatibility
+outside the verified environment.

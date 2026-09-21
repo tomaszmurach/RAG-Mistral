@@ -6,9 +6,9 @@ Polish IT incident-response procedure.
 
 **document → section chunks → E5 embeddings → FAISS retrieval → chat prompt → answer**
 
-The pipeline completed end-to-end in Google Colab on a Tesla T4. The results below
-come from that run, **before the latest prompt and generation-configuration changes**.
-Those changes still require a follow-up GPU smoke run.
+The final implementation completed a real **Google Colab / Tesla T4 GPU smoke
+run**, exercising both greedy and sampling generation. All **22/22 lightweight
+tests passed** in the verified environment.
 
 ## How it works
 
@@ -39,9 +39,16 @@ highly and still produce unsupported answers.
 
 The original 10 answerable questions retrieved the expected section at top-1.
 All 16 answerable paraphrases scored at least 0.82; 15 retrieved the expected
-section first. An observed unsupported inference at threshold 0.80 motivated
-stricter instructions and the new threshold. See [recorded results](examples/results.md)
-for score ranges, refusal outcomes, and limitations.
+section first. These historical measurements motivated the current threshold
+and stricter grounding instructions.
+
+In the final smoke run, the known hard negative, “Kto jest właścicielem tej
+procedury?”, was rejected by retrieval at **0.82** and correctly refused by
+Mistral at an explicit **0.80** override. The strengthened prompt corrected the
+earlier unsupported answer, “Organizacja”, in this tested case. The out-of-domain
+control was also rejected. See [recorded results](examples/results.md) for the
+separate historical evaluation and final verification; this is a small evaluation
+set, not a general benchmark or statistical claim.
 
 ## Verified environment
 
@@ -60,10 +67,9 @@ elsewhere or imply that this is the only environment that could work.
 | NumPy | 2.1.3 |
 | FAISS (`faiss-cpu`) | 1.15.1 |
 
-Observed GPU memory after loading both models: approximately **5317 MiB
-(~5.2 GiB)**. This is a loaded-pipeline observation, not peak generation memory
-or a minimum VRAM requirement. The pre-update lightweight suite passed **20/20**
-in Colab, and the complete Mistral + E5 + FAISS pipeline ran successfully.
+Observed GPU memory after final pipeline loading/use: approximately **5500 MiB
+(~5.4 GiB)**. This is an observed loaded-runtime value, not peak generation memory
+or a minimum VRAM guarantee.
 
 ## Run
 
@@ -86,6 +92,10 @@ pin accepts the verified `+cu128` build but does not select a CUDA wheel by itse
 No CUDA/NVIDIA transitive packages or unrelated Colab packages are pinned.
 These are observed working versions, not a complete environment lock.
 
+Unauthenticated Hugging Face Hub requests may produce a warning when `HF_TOKEN`
+is unset. This is expected, not a project error; a token is not required for this
+demo, and the warning is not suppressed.
+
 The demo covers a direct question, a paraphrase, an on-topic missing fact, an
 out-of-domain question, and a question asking for two responsibilities.
 
@@ -105,11 +115,13 @@ outside `[-1, 1]`, and negative temperatures raise `ValueError`.
 python -m unittest discover -s tests -v
 ```
 
-The expanded suite has **22 lightweight checks**, using NumPy and model/FAISS
-doubles without downloads or CUDA. These checks do not validate model quality or
-prove that real Transformers warnings are gone. The final modified version needs
-a GPU smoke run, including greedy and sampling calls and the known hard negative
-at both 0.82 (pipeline refusal) and an explicit 0.80 override (model refusal).
+The **22 lightweight checks** use NumPy and model/FAISS doubles without downloads
+or CUDA. They passed alongside the separate final GPU smoke run. In that GPU run,
+both greedy and sampling (`temperature=0.5`) produced correct grounded answers
+for the answerable control. The previous Transformers warnings about mixed
+generation configuration/kwargs, conflicting length settings, and BPE tokenization
+cleanup were no longer observed. Lightweight tests alone do not validate model
+quality or real-library integration.
 
 This remains a small demonstration: the section chunker targets this short
 corpus, answers are not independently verified, and longer documents would need
